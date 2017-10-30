@@ -91,7 +91,7 @@ mkManagerSettingsContext' set mcontext tls sockHTTP sockHTTPS = set
     , managerRetryableException = \e ->
         case () of
             ()
-                | ((fromException e)::(Maybe TLS.TLSError))==Just TLS.Error_EOF -> True
+                | Just TLS.Error_EOF <- fromException e -> True
                 | otherwise -> managerRetryableException defaultManagerSettings e
     , managerWrapException = \req ->
         let wrapper se
