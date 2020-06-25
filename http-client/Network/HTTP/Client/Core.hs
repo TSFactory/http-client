@@ -1,5 +1,4 @@
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 module Network.HTTP.Client.Core
     ( withResponse
@@ -12,11 +11,13 @@ module Network.HTTP.Client.Core
     , responseClose
     , httpRedirect
     , httpRedirect'
+    , withConnection
     ) where
 
 import Network.HTTP.Types
 import Network.HTTP.Client.Manager
 import Network.HTTP.Client.Types
+import Network.HTTP.Client.Headers
 import Network.HTTP.Client.Body
 import Network.HTTP.Client.Request
 import Network.HTTP.Client.Response
@@ -28,6 +29,7 @@ import qualified Data.ByteString.Lazy as L
 import Data.Monoid
 import Control.Monad (void)
 import System.Timeout (timeout)
+import Data.KeyedPool
 
 -- | Perform a @Request@ using a connection acquired from the given @Manager@,
 -- and then provide the @Response@ to the given function. This function is
@@ -90,7 +92,7 @@ httpRaw' req0 m = do
             now <- getCurrentTime
             return $ insertCookiesIntoRequest req' (evictExpiredCookies cj now) now
         Nothing -> return (req', Data.Monoid.mempty)
-    (timeout', (connRelease, ci, isManaged)) <- getConnectionWrapper
+    (timeout', mconn) <- getConnectionWrapper
         (responseTimeout' req)
         (getConn req m)
 
@@ -99,20 +101,20 @@ httpRaw' req0 m = do
     -- connections after accepting the request headers, so we need to check for
     -- exceptions in both.
     ex <- try $ do
-        cont <- requestBuilder (dropProxyAuthSecure req) ci
+        cont <- requestBuilder (dropProxyAuthSecure req) (managedResource mconn)
 
-        getResponse connRelease timeout' req ci cont
+        getResponse timeout' req mconn cont
 
-    case (ex, isManaged) of
+    case ex of
         -- Connection was reused, and might have been closed. Try again
-        (Left e, Reused) | mRetryableException m e -> do
-            connRelease DontReuse
+        Left e | managedReused mconn && mRetryableException m e -> do
+            managedRelease mconn DontReuse
             httpRaw' req m
         -- Not reused, or a non-retry, so this is a real exception
-        (Left e, _) -> throwIO e
+        Left e -> throwIO e
         -- Everything went ok, so the connection is good. If any exceptions get
         -- thrown in the response body, just throw them as normal.
-        (Right res, _) -> case cookieJar req' of
+        Right res -> case cookieJar req' of
             Just _ -> do
                 now' <- getCurrentTime
                 let (cookie_jar, _) = updateCookieJar res req now' cookie_jar'
@@ -189,6 +191,9 @@ getModifiedRequestManager manager0 req0 = do
 -- Since 0.1.0
 responseOpen :: Request -> Manager -> IO (Response BodyReader)
 responseOpen inputReq manager' = do
+  case validateHeaders (requestHeaders inputReq) of
+    GoodHeaders -> return ()
+    BadHeaders reason -> throwHttp $ InvalidRequestHeader reason
   (manager, req0) <- getModifiedRequestManager manager' inputReq
   wrapExc req0 $ mWrapException manager req0 $ do
     (req, res) <- go manager (redirectCount req0) req0
@@ -270,3 +275,15 @@ httpRedirect' count0 http' req0 = go count0 req0 []
 -- Since 0.1.0
 responseClose :: Response a -> IO ()
 responseClose = runResponseClose . responseClose'
+
+-- | Perform an action using a @Connection@ acquired from the given @Manager@.
+--
+-- You should use this only when you have to read and write interactively
+-- through the connection (e.g. connection by the WebSocket protocol).
+--
+-- @since 0.5.13
+withConnection :: Request -> Manager -> (Connection -> IO a) -> IO a
+withConnection origReq man action = do
+    mHttpConn <- getConn (mSetProxy man origReq) man
+    action (managedResource mHttpConn) <* keepAlive mHttpConn
+        `finally` managedRelease mHttpConn DontReuse

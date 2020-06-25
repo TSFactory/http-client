@@ -1,7 +1,5 @@
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE RecordWildCards #-}
 module Network.HTTP.Client.Response
     ( getRedirectedRequest
     , getResponse
@@ -11,6 +9,8 @@ module Network.HTTP.Client.Response
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as L
+import qualified Data.CaseInsensitive as CI
+import Control.Arrow (second)
 
 import Data.Monoid (mempty)
 
@@ -23,6 +23,7 @@ import Network.HTTP.Client.Request
 import Network.HTTP.Client.Util
 import Network.HTTP.Client.Body
 import Network.HTTP.Client.Headers
+import Data.KeyedPool
 
 -- | If a request is a redirection (status code 3xx) this function will create
 -- a new request from the old request, the server headers returned with the
@@ -52,7 +53,11 @@ getRedirectedRequest req hs cookie_jar code
     | 300 <= code && code < 400 = do
         l' <- lookup "location" hs
         let l = escapeURIString isAllowedInURI (S8.unpack l')
-        req' <- setUriRelative req =<< parseURIReference l
+            stripHeaders r =
+              r{requestHeaders =
+                filter (not . shouldStripHeaderOnRedirect req . fst) $
+                requestHeaders r}
+        req' <- fmap stripHeaders <$> setUriRelative req =<< parseURIReference l
         return $
             if code == 302 || code == 303
                 -- According to the spec, this should *only* be for status code
@@ -78,20 +83,20 @@ lbsResponse res = do
         { responseBody = L.fromChunks bss
         }
 
-getResponse :: ConnRelease
-            -> Maybe Int
+getResponse :: Maybe Int
             -> Request
-            -> Connection
+            -> Managed Connection
             -> Maybe (IO ()) -- ^ Action to run in case of a '100 Continue'.
             -> IO (Response BodyReader)
-getResponse connRelease timeout' req@(Request {..}) conn cont = do
+getResponse timeout' req@(Request {..}) mconn cont = do
+    let conn = managedResource mconn
     StatusHeaders s version hs <- parseStatusHeaders conn timeout' cont
-    let mcl = lookup "content-length" hs >>= readDec . S8.unpack
-        isChunked = ("transfer-encoding", "chunked") `elem` hs
+    let mcl = lookup "content-length" hs >>= readPositiveInt . S8.unpack
+        isChunked = ("transfer-encoding", CI.mk "chunked") `elem` map (second CI.mk) hs
 
         -- should we put this connection back into the connection manager?
         toPut = Just "close" /= lookup "connection" hs && version > W.HttpVersion 1 0
-        cleanup bodyConsumed = connRelease $ if toPut && bodyConsumed then Reuse else DontReuse
+        cleanup bodyConsumed = managedRelease mconn $ if toPut && bodyConsumed then Reuse else DontReuse
 
     body <-
         -- RFC 2616 section 4.4_1 defines responses that must not include a body
@@ -102,15 +107,14 @@ getResponse connRelease timeout' req@(Request {..}) conn cont = do
             else do
                 body1 <-
                     if isChunked
-                        then makeChunkedReader rawBody conn
+                        then makeChunkedReader (cleanup True) rawBody conn
                         else
                             case mcl of
-                                Just len -> makeLengthReader len conn
-                                Nothing -> makeUnlimitedReader conn
-                body2 <- if needsGunzip req hs
+                                Just len -> makeLengthReader (cleanup True) len conn
+                                Nothing -> makeUnlimitedReader (cleanup True) conn
+                if needsGunzip req hs
                     then makeGzipReader body1
                     else return body1
-                return $ brAddCleanup (cleanup True) body2
 
     return Response
         { responseStatus = s

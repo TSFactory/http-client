@@ -1,8 +1,8 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE DeriveFoldable #-}
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE OverloadedStrings #-}
 module Network.HTTP.Client.Types
     ( BodyReader
     , Connection (..)
@@ -13,16 +13,18 @@ module Network.HTTP.Client.Types
     , throwHttp
     , toHttpException
     , Cookie (..)
+    , equalCookie
+    , equivCookie
+    , compareCookies
     , CookieJar (..)
+    , equalCookieJar
+    , equivCookieJar
     , Proxy (..)
     , RequestBody (..)
     , Popper
     , NeedsPopper
     , GivesPopper
     , Request (..)
-    , ConnReuse (..)
-    , ConnRelease
-    , ManagedConn (..)
     , Response (..)
     , ResponseClose (..)
     , Manager (..)
@@ -46,7 +48,8 @@ import qualified Data.ByteString.Lazy as L
 import Blaze.ByteString.Builder (Builder, fromLazyByteString, fromByteString, toLazyByteString)
 import Data.Int (Int64)
 import Data.Foldable (Foldable)
-import Data.Monoid
+import Data.Monoid (Monoid(..))
+import Data.Semigroup (Semigroup(..))
 import Data.String (IsString, fromString)
 import Data.Time (UTCTime)
 import Data.Traversable (Traversable)
@@ -54,12 +57,11 @@ import qualified Data.List as DL
 import Network.Socket (HostAddress)
 import Data.IORef
 import qualified Network.Socket as NS
-import qualified Data.IORef as I
 import qualified Data.Map as Map
 import Data.Text (Text)
 import Data.Streaming.Zlib (ZlibException)
-import Control.Concurrent.MVar (MVar)
 import Data.CaseInsensitive as CI
+import Data.KeyedPool (KeyedPool)
 
 -- | An @IO@ action that represents an incoming response body coming from the
 -- server. Data provided by this action has already been gunzipped and
@@ -80,7 +82,7 @@ data Connection = Connection
       -- ^ Send data to server
     , connectionClose :: IO ()
       -- ^ Close connection. Any successive operation on the connection
-      -- (exept closing) should fail with `ConnectionClosed` exception.
+      -- (except closing) should fail with `ConnectionClosed` exception.
       -- It is allowed to close connection multiple times.
     }
     deriving T.Typeable
@@ -159,7 +161,7 @@ data HttpExceptionContent
                    --
                    -- @since 0.5.0
                    | ConnectionFailure SomeException
-                   -- ^ An exception occured when trying to connect to the
+                   -- ^ An exception occurred when trying to connect to the
                    -- server.
                    --
                    -- @since 0.5.0
@@ -171,6 +173,10 @@ data HttpExceptionContent
                    -- ^ The given response header line could not be parsed
                    --
                    -- @since 0.5.0
+                   | InvalidRequestHeader S.ByteString
+                   -- ^ The given request header is not compliant (e.g. has newlines)
+                   --
+                   -- @since 0.5.14
                    | InternalException SomeException
                    -- ^ An exception was raised by an underlying library when
                    -- performing the request. Most often, this is caused by a
@@ -262,32 +268,75 @@ data Cookie = Cookie
 newtype CookieJar = CJ { expose :: [Cookie] }
   deriving (Read, Show, T.Typeable)
 
--- This corresponds to step 11 of the algorithm described in Section 5.3 \"Storage Model\"
-instance Eq Cookie where
-  (==) a b = name_matches && domain_matches && path_matches
-    where name_matches = cookie_name a == cookie_name b
-          domain_matches = CI.foldCase (cookie_domain a) == CI.foldCase (cookie_domain b)
-          path_matches = cookie_path a == cookie_path b
+-- | Instead of '(==)'.
+--
+-- Since there was some confusion in the history of this library about how the 'Eq' instance
+-- should work, it was removed for clarity, and replaced by 'equal' and 'equiv'.  'equal'
+-- gives you equality of all fields of the 'Cookie' record.
+--
+-- @since 0.7.0
+equalCookie :: Cookie -> Cookie -> Bool
+equalCookie a b = and
+  [ cookie_name a == cookie_name b
+  , cookie_value a == cookie_value b
+  , cookie_expiry_time a == cookie_expiry_time b
+  , cookie_domain a == cookie_domain b
+  , cookie_path a == cookie_path b
+  , cookie_creation_time a == cookie_creation_time b
+  , cookie_last_access_time a == cookie_last_access_time b
+  , cookie_persistent a == cookie_persistent b
+  , cookie_host_only a == cookie_host_only b
+  , cookie_secure_only a == cookie_secure_only b
+  , cookie_http_only a == cookie_http_only b
+  ]
 
-instance Ord Cookie where
-  compare c1 c2
+-- | Equality of name, domain, path only.  This corresponds to step 11 of the algorithm
+-- described in Section 5.3 \"Storage Model\".  See also: 'equal'.
+--
+-- @since 0.7.0
+equivCookie :: Cookie -> Cookie -> Bool
+equivCookie a b = name_matches && domain_matches && path_matches
+  where name_matches = cookie_name a == cookie_name b
+        domain_matches = CI.foldCase (cookie_domain a) == CI.foldCase (cookie_domain b)
+        path_matches = cookie_path a == cookie_path b
+
+-- | Instead of @instance Ord Cookie@.  See 'equalCookie', 'equivCookie'.
+--
+-- @since 0.7.0
+compareCookies :: Cookie -> Cookie -> Ordering
+compareCookies c1 c2
     | S.length (cookie_path c1) > S.length (cookie_path c2) = LT
     | S.length (cookie_path c1) < S.length (cookie_path c2) = GT
     | cookie_creation_time c1 > cookie_creation_time c2 = GT
     | otherwise = LT
 
-instance Eq CookieJar where
-  (==) cj1 cj2 = (DL.sort $ expose cj1) == (DL.sort $ expose cj2)
+-- | See 'equalCookie'.
+--
+-- @since 0.7.0
+equalCookieJar :: CookieJar -> CookieJar -> Bool
+equalCookieJar (CJ cj1) (CJ cj2) = and $ zipWith equalCookie cj1 cj2
 
--- | Since 1.9
-instance Data.Monoid.Monoid CookieJar where
-  mempty = CJ []
-  (CJ a) `mappend` (CJ b) = CJ (DL.nub $ DL.sortBy compare' $ a `mappend` b)
-    where compare' c1 c2 =
+-- | See 'equalCookieJar', 'equalCookie'.
+--
+-- @since 0.7.0
+equivCookieJar :: CookieJar -> CookieJar -> Bool
+equivCookieJar cj1 cj2 = and $
+  zipWith equivCookie (DL.sortBy compareCookies $ expose cj1) (DL.sortBy compareCookies $ expose cj2)
+
+instance Semigroup CookieJar where
+  (CJ a) <> (CJ b) = CJ (DL.nubBy equivCookie $ DL.sortBy mostRecentFirst $ a <> b)
+    where mostRecentFirst c1 c2 =
             -- inverse so that recent cookies are kept by nub over older
             if cookie_creation_time c1 > cookie_creation_time c2
                 then LT
                 else GT
+
+-- | Since 1.9
+instance Data.Monoid.Monoid CookieJar where
+  mempty = CJ []
+#if !(MIN_VERSION_base(4,11,0))
+  mappend = (<>)
+#endif
 
 -- | Define a HTTP proxy, consisting of a hostname and port number.
 
@@ -325,9 +374,14 @@ instance IsString RequestBody where
     fromString str = RequestBodyBS (fromString str)
 instance Monoid RequestBody where
     mempty = RequestBodyBS S.empty
-    mappend x0 y0 =
+#if !(MIN_VERSION_base(4,11,0))
+    mappend = (<>)
+#endif
+
+instance Semigroup RequestBody where
+    x0 <> y0 =
         case (simplify x0, simplify y0) of
-            (Left (i, x), Left (j, y)) -> RequestBodyBuilder (i + j) (x `mappend` y)
+            (Left (i, x), Left (j, y)) -> RequestBodyBuilder (i + j) (x <> y)
             (Left x, Right y) -> combine (builderToStream x) y
             (Right x, Left y) -> combine x (builderToStream y)
             (Right x, Right y) -> combine x y
@@ -507,9 +561,9 @@ data Request = Request
     --
     -- @since 0.5.0
     , responseTimeout :: ResponseTimeout
-    -- ^ Number of microseconds to wait for a response. If
-    -- @Nothing@, will wait indefinitely. Default: use
-    -- 'managerResponseTimeout' (which by default is 30 seconds).
+    -- ^ Number of microseconds to wait for a response (see 'ResponseTimeout'
+    -- for more information). Default: use 'managerResponseTimeout' (which by
+    -- default is 30 seconds).
     --
     -- Since 0.1.0
     , cookieJar :: Maybe CookieJar
@@ -540,16 +594,27 @@ data Request = Request
     -- dealing with implicit global managers, such as in @Network.HTTP.Simple@
     --
     -- @since 0.4.28
+
+    , shouldStripHeaderOnRedirect :: HeaderName -> Bool
+    -- ^ Decide whether a header must be stripped from the request
+    -- when following a redirect. Default: keep all headers intact.
+    --
+    -- @since 0.6.2
     }
     deriving T.Typeable
 
--- | How to deal with timing out a response
+-- | How to deal with timing out on retrieval of response headers.
 --
 -- @since 0.5.0
 data ResponseTimeout
     = ResponseTimeoutMicro !Int
+    -- ^ Wait the given number of microseconds for response headers to
+    -- load, then throw an exception
     | ResponseTimeoutNone
+    -- ^ Wait indefinitely
     | ResponseTimeoutDefault
+    -- ^ Fall back to the manager setting ('managerResponseTimeout') or, in its
+    -- absence, Wait 30 seconds and then throw an exception.
     deriving (Eq, Show)
 
 instance Show Request where
@@ -558,7 +623,7 @@ instance Show Request where
         , "  host                 = " ++ show (host x)
         , "  port                 = " ++ show (port x)
         , "  secure               = " ++ show (secure x)
-        , "  requestHeaders       = " ++ show (requestHeaders x)
+        , "  requestHeaders       = " ++ show (DL.map redactSensitiveHeader (requestHeaders x))
         , "  path                 = " ++ show (path x)
         , "  queryString          = " ++ show (queryString x)
         --, "  requestBody          = " ++ show (requestBody x)
@@ -571,12 +636,9 @@ instance Show Request where
         , "}"
         ]
 
-data ConnReuse = Reuse | DontReuse
-    deriving T.Typeable
-
-type ConnRelease = ConnReuse -> IO ()
-
-data ManagedConn = Fresh | Reused
+redactSensitiveHeader :: Header -> Header
+redactSensitiveHeader ("Authorization", _) = ("Authorization", "<REDACTED>")
+redactSensitiveHeader h = h
 
 -- | A simple representation of the HTTP response.
 --
@@ -611,14 +673,18 @@ data Response body = Response
     --
     -- Since 0.1.0
     }
-    deriving (Show, Eq, T.Typeable, Functor, Data.Foldable.Foldable, Data.Traversable.Traversable)
+    deriving (Show, T.Typeable, Functor, Data.Foldable.Foldable, Data.Traversable.Traversable)
+
+-- Purposely not providing this instance.  It used to use 'equivCookieJar'
+-- semantics before 0.7.0, but should, if anything, use 'equalCookieJar'
+-- semantics.
+--
+-- instance Exception Eq
 
 newtype ResponseClose = ResponseClose { runResponseClose :: IO () }
     deriving T.Typeable
 instance Show ResponseClose where
     show _ = "ResponseClose"
-instance Eq ResponseClose where
-    _ == _ = True
 
 -- | Settings for a @Manager@. Please use the 'defaultManagerSettings' function and then modify
 -- individual settings. For more information, see <http://www.yesodweb.com/book/settings-types>.
@@ -667,13 +733,18 @@ data ManagerSettings = ManagerSettings
     --
     -- This limit helps deal with the case where you are making a large number
     -- of connections to different hosts. Without this limit, you could run out
-    -- of file descriptors.
+    -- of file descriptors. Additionally, it can be set to zero to prevent
+    -- reuse of any connections. Doing this is useful when the server your application
+    -- is talking to sits behind a load balancer.
     --
     -- Default: 512
     --
     -- Since 0.3.7
     , managerModifyRequest :: Request -> IO Request
     -- ^ Perform the given modification to a @Request@ before performing it.
+    --
+    -- This function may be called more than once during request processing.
+    -- see https://github.com/snoyberg/http-client/issues/350
     --
     -- Default: no modification
     --
@@ -713,24 +784,11 @@ newtype ProxyOverride = ProxyOverride
 --
 -- Since 0.1.0
 data Manager = Manager
-    { mConns :: I.IORef ConnsMap
-    -- ^ @Nothing@ indicates that the manager is closed.
-    , mConnsBaton :: MVar ()
-    -- ^ Used to indicate to the reaper thread that it has some work to do.
-    -- This must be filled every time a connection is returned to the manager.
-    -- While redundant with the @IORef@ above, this allows us to have the
-    -- reaper thread fully blocked instead of running every 5 seconds when
-    -- there are no connections to manage.
-    , mMaxConns :: Int
-    -- ^ This is a per-@ConnKey@ value.
+    { mConns :: KeyedPool ConnKey Connection
     , mResponseTimeout :: ResponseTimeout
     -- ^ Copied from 'managerResponseTimeout'
-    , mRawConnection :: Maybe NS.HostAddress -> String -> Int -> IO Connection
-    , mTlsConnection :: Maybe NS.HostAddress -> String -> Int -> IO Connection
-    , mTlsProxyConnection :: S.ByteString -> (Connection -> IO ()) -> String -> Maybe NS.HostAddress -> String -> Int -> IO Connection
     , mRetryableException :: SomeException -> Bool
     , mWrapException :: forall a. Request -> IO a -> IO a
-    , mIdleConnectionCount :: Int
     , mModifyRequest :: Request -> IO Request
     , mSetProxy :: Request -> Request
     , mModifyResponse      :: Response BodyReader -> IO (Response BodyReader)
@@ -760,7 +818,21 @@ data ConnHost =
 
 -- | @ConnKey@ consists of a hostname, a port and a @Bool@
 -- specifying whether to use SSL.
-data ConnKey = ConnKey ConnHost Int S.ByteString Int Bool
+data ConnKey
+    = CKRaw (Maybe HostAddress) {-# UNPACK #-} !S.ByteString !Int
+    | CKSecure (Maybe HostAddress) {-# UNPACK #-} !S.ByteString !Int
+    | CKProxy
+        {-# UNPACK #-} !S.ByteString
+        !Int
+
+        -- Proxy-Authorization request header
+        (Maybe S.ByteString)
+
+        -- ultimate host
+        {-# UNPACK #-} !S.ByteString
+
+        -- ultimate port
+        !Int
     deriving (Eq, Show, Ord, T.Typeable)
 
 -- | Status of streaming a request body from a file.

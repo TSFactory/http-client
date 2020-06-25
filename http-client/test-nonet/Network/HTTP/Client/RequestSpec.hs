@@ -10,18 +10,35 @@ import Network.HTTP.Client.Internal
 import Network.URI (URI(..), URIAuth(..), parseURI)
 import Test.Hspec
 import Data.Monoid ((<>))
+import Network.HTTP.Client (defaultRequest)
+import Data.List (isInfixOf)
 
 spec :: Spec
 spec = do
     describe "case insensitive scheme" $ do
-        forM_ ["http://example.com", "httP://example.com", "HttP://example.com", "HttPs://example.com"] $ \url ->
+        forM_ ["http://example.com", "httP://example.com", "HttP://example.com", "HttPs://example.com"] $ \url -> do
             it url $ case parseUrlThrow url of
                 Nothing -> error "failed"
                 Just _ -> return () :: IO ()
-        forM_ ["ftp://example.com"] $ \url ->
+            it ("URI " ++ url) $ do
+                case parseURI url of
+                    Nothing -> error ("invalid test URI: " ++ url)
+                    Just uri ->
+                        case requestFromURI uri of
+                            Nothing -> error "failed"
+                            Just _ -> return () :: IO ()
+        forM_ ["ftp://example.com"] $ \url -> do
             it url $ case parseUrlThrow url of
                 Nothing -> return () :: IO ()
                 Just req -> error $ show req
+            it ("URI " ++ url) $ do
+                case parseURI url of
+                    Nothing -> error ("invalid test URI: " ++ url)
+                    Just uri ->
+                        case requestFromURI uri of
+                            Nothing -> return () :: IO ()
+                            Just req -> error (show req)
+
 
     describe "authentication in url" $ do
       it "passes validation" $ do
@@ -36,6 +53,30 @@ spec = do
         (uriRegName $ fromJust $ uriAuthority $ getUri $ fromJust request) `shouldBe` requestHostnameWithoutAuth
         field `shouldSatisfy` isJust
         field `shouldBe` Just "Basic dXNlcjpwYXNz"
+
+    describe "getUri" $ do
+      context "when protocol is http and port is 80" $ do
+        it "omits port" $ do
+          let url = "http://example.com/"
+          request <- parseRequest url
+          show (getUri request) `shouldBe` url
+
+      context "when protocol is https and port is 443" $ do
+        it "omits port" $ do
+          let url = "https://example.com/"
+          request <- parseRequest url
+          show (getUri request) `shouldBe` url
+
+      context "when protocol is https and port is 80" $ do
+        it "does not omit port" $ do
+          let url = "https://example.com:80/"
+          request <- parseRequest url
+          show (getUri request) `shouldBe` url
+
+    describe "Show Request" $
+      it "redacts authorization header content" $ do
+        let request = defaultRequest { requestHeaders = [("Authorization", "secret")] }
+        isInfixOf "secret" (show request) `shouldBe` False
 
     describe "applyBasicProxyAuth" $ do
         let request = applyBasicProxyAuth "user" "pass" <$> parseUrlThrow "http://example.org"

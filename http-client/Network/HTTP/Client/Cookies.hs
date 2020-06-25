@@ -100,7 +100,7 @@ removeExistingCookieFromCookieJar cookie cookie_jar' = (mc, CJ lc)
   where (mc, lc) = removeExistingCookieFromCookieJarHelper cookie (expose cookie_jar')
         removeExistingCookieFromCookieJarHelper _ [] = (Nothing, [])
         removeExistingCookieFromCookieJarHelper c (c' : cs)
-          | c == c' = (Just c', cs)
+          | c `equivCookie` c' = (Just c', cs)
           | otherwise = (cookie', c' : cookie_jar'')
           where (cookie', cookie_jar'') = removeExistingCookieFromCookieJarHelper c cs
 
@@ -121,7 +121,7 @@ evictExpiredCookies cookie_jar' now = CJ $ filter (\ cookie -> cookie_expiry_tim
 insertCookiesIntoRequest :: Req.Request                 -- ^ The request to insert into
                          -> CookieJar                   -- ^ Current cookie jar
                          -> UTCTime                     -- ^ Value that should be used as \"now\"
-                         -> (Req.Request, CookieJar)    -- ^ (Ouptut request, Updated cookie jar (last-access-time is updated))
+                         -> (Req.Request, CookieJar)    -- ^ (Output request, Updated cookie jar (last-access-time is updated))
 insertCookiesIntoRequest request cookie_jar now
   | BS.null cookie_string = (request, cookie_jar')
   | otherwise = (request {Req.requestHeaders = cookie_header : purgedHeaders}, cookie_jar')
@@ -148,7 +148,7 @@ computeCookieString request cookie_jar now is_http_api = (output_line, cookie_ja
                   | not (cookie_http_only cookie) = True
                   | otherwise = is_http_api
         matching_cookies = filter matching_cookie $ expose cookie_jar
-        output_cookies =  map (\ c -> (cookie_name c, cookie_value c)) $ L.sort matching_cookies
+        output_cookies =  map (\ c -> (cookie_name c, cookie_value c)) $ L.sortBy compareCookies matching_cookies
         output_line = toByteString $ renderCookies $ output_cookies
         folding_function cookie_jar'' cookie = case removeExistingCookieFromCookieJar cookie cookie_jar'' of
           (Just c, cookie_jar''') -> insertIntoCookieJar (c {cookie_last_access_time = now}) cookie_jar'''

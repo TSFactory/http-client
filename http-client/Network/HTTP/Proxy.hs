@@ -1,5 +1,6 @@
 {-# LANGUAGE CPP               #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE FlexibleContexts  #-}
 
 {-
 Copyright (c) 2002, Warrick Gray
@@ -174,8 +175,13 @@ registryProxyString = catch
     enable <- toBool . maybe 0 id A.<$> regQueryValueDWORD hkey "ProxyEnable"
     if enable
         then do
+#if MIN_VERSION_Win32(2, 6, 0) && !MIN_VERSION_Win32(2, 8, 0)
+            server <- regQueryValue hkey "ProxyServer"
+            exceptions <- try $ regQueryValue hkey "ProxyOverride" :: IO (Either IOException String)
+#else
             server <- regQueryValue hkey (Just "ProxyServer")
             exceptions <- try $ regQueryValue hkey (Just "ProxyOverride") :: IO (Either IOException String)
+#endif
             return $ Just (server, either (const "") id exceptions)
         else return Nothing)
   hideError where

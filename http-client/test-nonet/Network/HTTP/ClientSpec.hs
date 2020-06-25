@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 module Network.HTTP.ClientSpec where
@@ -12,6 +13,7 @@ import           Network.HTTP.Client       hiding (port)
 import qualified Network.HTTP.Client       as NC
 import qualified Network.HTTP.Client.Internal as Internal
 import           Network.HTTP.Types        (status413)
+import           Network.HTTP.Types.Header
 import qualified Network.Socket            as NS
 import           Test.Hspec
 import qualified Data.Streaming.Network    as N
@@ -21,6 +23,14 @@ import           Data.ByteString.Lazy.Char8 () -- orphan instance
 import           Data.IORef
 import           System.Mem                (performGC)
 
+-- See: https://github.com/snoyberg/http-client/issues/111#issuecomment-366526660
+notWindows :: Monad m => m () -> m ()
+#ifdef WINDOWS
+notWindows _ = return ()
+#else
+notWindows x = x
+#endif
+
 main :: IO ()
 main = hspec spec
 
@@ -29,21 +39,28 @@ silentIOError a = a `E.catch` \e -> do
   let _ = e :: IOError
   return ()
 
-redirectServer :: (Int -> IO a) -> IO a
-redirectServer inner = bracket
+redirectServer :: Maybe Int
+               -- ^ If Just, stop redirecting after that many hops.
+               -> (Int -> IO a) -> IO a
+redirectServer maxRedirects inner = bracket
     (N.bindRandomPortTCP "*4")
     (NS.close . snd)
     $ \(port, lsocket) -> withAsync
         (N.runTCPServer (N.serverSettingsTCPSocket lsocket) app)
         (const $ inner port)
   where
+    redirect ad = do
+        N.appWrite ad "HTTP/1.1 301 Redirect\r\nLocation: /\r\ncontent-length: 5\r\n\r\n"
+        threadDelay 10000
+        N.appWrite ad "hello\r\n"
+        threadDelay 10000
     app ad = Async.race_
         (silentIOError $ forever (N.appRead ad))
-        (silentIOError $ forever $ do
-            N.appWrite ad "HTTP/1.1 301 Redirect\r\nLocation: /\r\ncontent-length: 5\r\n\r\n"
-            threadDelay 10000
-            N.appWrite ad "hello\r\n"
-            threadDelay 10000)
+        (silentIOError $ case maxRedirects of
+            Nothing -> forever $ redirect ad
+            Just n ->
+              replicateM_ n (redirect ad) >>
+              N.appWrite ad "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello\r\n")
 
 redirectCloseServer :: (Int -> IO a) -> IO a
 redirectCloseServer inner = bracket
@@ -57,7 +74,9 @@ redirectCloseServer inner = bracket
       Async.race_
           (silentIOError $ forever (N.appRead ad))
           (silentIOError $ N.appWrite ad "HTTP/1.1 301 Redirect\r\nLocation: /\r\nConnection: close\r\n\r\nhello")
-      N.appCloseConnection ad
+      case N.appRawSocket ad of
+        Nothing -> error "appRawSocket failed"
+        Just s -> NS.shutdown s NS.ShutdownSend
 
 bad100Server :: Bool -- ^ include extra headers?
              -> (Int -> IO a) -> IO a
@@ -110,12 +129,14 @@ lengthZeroAndChunkZero :: (Int -> IO a) -> IO a
 lengthZeroAndChunkZero = serveWith "HTTP/1.1 200 OK\r\ncontent-length: 0\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n"
 
 serveWith :: S.ByteString -> (Int -> IO a) -> IO a
-serveWith resp inner = bracket
-    (N.bindRandomPortTCP "*4")
-    (NS.close . snd)
-    $ \(port, lsocket) -> withAsync
-        (N.runTCPServer (N.serverSettingsTCPSocket lsocket) app)
-        (const $ inner port)
+serveWith resp inner = do
+  (port, lsocket) <- (N.bindRandomPortTCP "*4")
+  res <- Async.race
+    (N.runTCPServer (N.serverSettingsTCPSocket lsocket) app)
+    (inner port)
+  case res of
+    Left () -> error $ "serveWith: got Left"
+    Right x -> return x
   where
     app ad = silentIOError $ do
         let readHeaders front = do
@@ -145,7 +166,18 @@ spec = describe "Client" $ do
                         _ -> False
                 return ()
         mapM_ test ["http://", "https://", "http://:8000", "https://:8001"]
-    it "redirecting #41" $ redirectServer $ \port -> do
+    it "headers can be stripped on redirect" $ redirectServer (Just 5) $ \port -> do
+        req' <- parseUrlThrow $ "http://127.0.0.1:" ++ show port
+        let req = req' { requestHeaders = [(hAuthorization, "abguvatgbfrrurer")]
+                       , redirectCount = 10
+                       , shouldStripHeaderOnRedirect = (== hAuthorization)
+                       }
+        man <- newManager defaultManagerSettings
+        withResponseHistory req man $ \hr -> do
+          print $ map (requestHeaders . fst) $ hrRedirects hr
+          mapM_ (\r -> requestHeaders r `shouldBe` []) $
+            map fst $ tail $ hrRedirects hr
+    it "redirecting #41" $ redirectServer Nothing $ \port -> do
         req' <- parseUrlThrow $ "http://127.0.0.1:" ++ show port
         let req = req' { redirectCount = 1 }
         man <- newManager defaultManagerSettings
@@ -154,7 +186,7 @@ spec = describe "Client" $ do
                 case e of
                     HttpExceptionRequest _ (TooManyRedirects _) -> True
                     _ -> False
-    it "redirectCount=0" $ redirectServer $ \port -> do
+    it "redirectCount=0" $ redirectServer Nothing $ \port -> do
         req' <- parseUrlThrow $ "http://127.0.0.1:" ++ show port
         let req = req' { redirectCount = 0 }
         man <- newManager defaultManagerSettings
@@ -185,28 +217,28 @@ spec = describe "Client" $ do
         test False
         test True
 
-    it "early close on a 413" $ earlyClose413 $ \port' -> do
+    notWindows $ it "early close on a 413" $ earlyClose413 $ \port' -> do
         man <- newManager defaultManagerSettings
         res <- getChunkedResponse port' man
         responseBody res `shouldBe` "goodbye"
         responseStatus res `shouldBe` status413
 
-    it "length zero and chunking zero #108" $ lengthZeroAndChunkZero $ \port' -> do
+    notWindows $ it "length zero and chunking zero #108" $ lengthZeroAndChunkZero $ \port' -> do
         man <- newManager defaultManagerSettings
         res <- getChunkedResponse port' man
         responseBody res `shouldBe` ""
 
-    it "length zero and chunking" $ lengthZeroAndChunked $ \port' -> do
+    notWindows $ it "length zero and chunking" $ lengthZeroAndChunked $ \port' -> do
         man <- newManager defaultManagerSettings
         res <- getChunkedResponse port' man
         responseBody res `shouldBe` "Wikipedia in\r\n\r\nchunks."
 
-    it "length and chunking" $ lengthAndChunked $ \port' -> do
+    notWindows $ it "length and chunking" $ lengthAndChunked $ \port' -> do
         man <- newManager defaultManagerSettings
         res <- getChunkedResponse port' man
         responseBody res `shouldBe` "Wikipedia in\r\n\r\nchunks."
 
-    it "withResponseHistory and redirect" $ redirectCloseServer $ \port -> do
+    notWindows $ it "withResponseHistory and redirect" $ redirectCloseServer $ \port -> do
         -- see https://github.com/snoyberg/http-client/issues/169
         req' <- parseUrlThrow $ "http://127.0.0.1:" ++ show port
         let req = req' {redirectCount = 1}
@@ -241,3 +273,8 @@ spec = describe "Client" $ do
         ok <- readIORef okRef
         unless ok $
           throwIO (ErrorCall "already closed")
+
+    it "does not allow port overflow #383" $ do
+      case parseRequest "https://o_O:18446744072699450606" of
+        Left _ -> pure () :: IO ()
+        Right req -> error $ "Invalid request: " ++ show req

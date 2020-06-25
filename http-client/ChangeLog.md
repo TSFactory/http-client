@@ -1,6 +1,99 @@
-## Unreleased
+# Changelog for http-client
+
+## 0.7.1
+
+* Remove `AI_ADDRCONFIG` [#400](https://github.com/snoyberg/http-client/issues/400)
+
+## 0.7.0
+
+* Remove Eq instances for Cookie, CookieJar, Response, Ord instance for Cookie [#435](https://github.com/snoyberg/http-client/pull/435)
+
+## 0.6.4.1
+
+* Win32 2.8 support [#430](https://github.com/snoyberg/http-client/pull/430)
+
+## 0.6.4
+
+* Avoid throwing an exception when a malformed HTTP header is received,
+  to be as robust as commonly used HTTP clients.
+  See [#398](https://github.com/snoyberg/http-client/issues/398)
+
+## 0.6.3
+
+* Detect response body termination before reading an extra null chunk
+  when possible. This allows connections to be reused in some corner
+  cases. See
+  [#395](https://github.com/snoyberg/http-client/issues/395)
+
+## 0.6.2
+
+* Add `shouldStripHeaderOnRedirect` option to `Request` [#300](https://github.com/snoyberg/http-client/issues/300)
+
+## 0.6.1.1
+
+* Ensure that `Int` parsing doesn't overflow [#383](https://github.com/snoyberg/http-client/issues/383)
+
+## 0.6.1
+
+* Add `setUriEither` to `Network.HTTP.Client.Internal`
+
+## 0.6.0
+
+* Generalize `renderParts` over arbitrary applicative functors.  One particular
+  use case that is enabled by this change is that now `renderParts` can be used
+  in pure code by using it in combination with `runIdentity`.
+
+## 0.5.14
+
+* Omit port for `getUri` when protocol is `http` and port is `80`, or when
+  protocol is `https` and port is `443`
+* Sending requests with invalid headers now throws InvalidRequestHeader exception
+
+## 0.5.13.1
+
+* Add a workaround for a cabal bug [haskell-infra/hackage-trustees#165](https://github.com/haskell-infra/hackage-trustees/issues/165)
+
+## 0.5.13
+
+* Adds `setRequestCheckStatus` and `throwErrorStatusCodes` functions.
+  See [#304](https://github.com/snoyberg/http-client/issues/304)
+* Add `withConnection` function.
+  See [#352](https://github.com/snoyberg/http-client/pull/352).
+
+## 0.5.12.1
+
+* Make the chunked transfer-encoding detection case insensitive
+  [#303](https://github.com/snoyberg/http-client/pull/303)
+* Remove some unneeded language extensions
+* Mark older versions of GHC as unsupported
+
+## 0.5.12
+
+* Added `requestFromURI` and `requestFromURI_` functions.
+* Fixed non-TLS connections going though proxy [#337](https://github.com/snoyberg/http-client/issues/337)
+
+## 0.5.11
+
+* Replaced `base64-bytestring` dependency with `memory`.
+
+## 0.5.10
+
+* New function to partial escape query strings
+
+## 0.5.9
+
+* Add `Semigroup` instances for GHC 8.4 [#320](https://github.com/snoyberg/http-client/pull/320)
+
+## 0.5.8
+
+* Switch to the new STM-based manager
+  [#254](https://github.com/snoyberg/http-client/pull/254)
+* Redact sensitive headers [#318](https://github.com/snoyberg/http-client/pull/318)
+
+## 0.5.7.1
 
 * Code cleanup/delete dead code
+* Compat with Win32 2.6 [#309](https://github.com/snoyberg/http-client/issues/309)
 
 ## 0.5.7.0
 

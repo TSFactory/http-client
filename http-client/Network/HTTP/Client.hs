@@ -1,8 +1,7 @@
-{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE DeriveTraversable #-}
-{-# LANGUAGE DeriveFoldable #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE CPP #-}
 -- |
 --
 -- = Simpler API
@@ -41,7 +40,7 @@
 -- application which will make a large number of requests to different hosts,
 -- and will never make more than one connection to a single host, then sharing
 -- a 'Manager' will result in idle connections being kept open longer than
--- necessary. In such a situation, it makes sense to use 'withManager' around
+-- necessary. In such a situation, it makes sense to use 'newManager' before
 -- each new request, to avoid running out of file descriptors. (Note that the
 -- 'managerIdleConnectionCount' setting mitigates the risk of leaking too many
 -- file descriptors.)
@@ -134,13 +133,18 @@ module Network.HTTP.Client
     , parseUrlThrow
     , parseRequest
     , parseRequest_
+    , requestFromURI
+    , requestFromURI_
     , defaultRequest
-
     , applyBasicAuth
     , urlEncodedBody
     , getUri
     , setRequestIgnoreStatus
+    , setRequestCheckStatus
     , setQueryString
+#if MIN_VERSION_http_types(0,12,1)
+    , setQueryStringPartialEscape
+#endif
       -- ** Request type and fields
     , Request
     , method
@@ -155,6 +159,7 @@ module Network.HTTP.Client
     , applyBasicProxyAuth
     , decompress
     , redirectCount
+    , shouldStripHeaderOnRedirect
     , checkResponse
     , responseTimeout
     , cookieJar
@@ -174,6 +179,7 @@ module Network.HTTP.Client
     , responseHeaders
     , responseBody
     , responseCookieJar
+    , throwErrorStatusCodes
       -- ** Response body
     , BodyReader
     , brRead
@@ -186,8 +192,14 @@ module Network.HTTP.Client
     , HttpException (..)
     , HttpExceptionContent (..)
     , Cookie (..)
+    , equalCookie
+    , equivCookie
+    , compareCookies
     , CookieJar
+    , equalCookieJar
+    , equivCookieJar
     , Proxy (..)
+    , withConnection
       -- * Cookies
     , module Network.HTTP.Client.Cookies
     ) where
@@ -310,7 +322,7 @@ managerSetProxy po = managerSetInsecureProxy po . managerSetSecureProxy po
 -- > main = do
 -- >   manager <- newManager defaultManagerSettings
 -- >
--- >   request <- parseRequest "http://httpbin.org/post"
+-- >   request <- parseRequest "http://httpbin.org/get"
 -- >   response <- httpLbs request manager
 -- >
 -- >   putStrLn $ "The status code was: " ++ (show $ statusCode $ responseStatus response)
@@ -335,7 +347,7 @@ managerSetProxy po = managerSetInsecureProxy po . managerSetSecureProxy po
 -- >    [ "name" .= ("Michael" :: Text)
 -- >    , "age"  .= (30 :: Int)
 -- >    ]
-
+-- >
 -- >   initialRequest <- parseRequest "http://httpbin.org/post"
 -- >   let request = initialRequest { method = "POST", requestBody = RequestBodyLBS $ encode requestObject }
 -- >
@@ -344,7 +356,8 @@ managerSetProxy po = managerSetInsecureProxy po . managerSetSecureProxy po
 -- >   print $ responseBody response
 --
 
--- | Specify a response timeout in microseconds
+-- | Specify maximum time in microseconds the retrieval of response
+-- headers is allowed to take
 --
 -- @since 0.5.0
 responseTimeoutMicro :: Int -> ResponseTimeout

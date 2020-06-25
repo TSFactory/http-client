@@ -1,7 +1,6 @@
-{-# LANGUAGE CPP                   #-}
-{-# LANGUAGE FlexibleContexts      #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE OverloadedStrings     #-}
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE FlexibleContexts  #-}
+{-# LANGUAGE OverloadedStrings #-}
 -- |
 --
 -- = Simpler API
@@ -31,7 +30,7 @@
 --
 -- > import Data.Conduit.Binary (sinkFile) -- Exported from the package conduit-extra
 -- > import Network.HTTP.Conduit
--- > import qualified Data.Conduit as C
+-- > import Conduit (runConduit, (.|))
 -- > import Control.Monad.Trans.Resource (runResourceT)
 -- >
 -- > main :: IO ()
@@ -40,7 +39,7 @@
 -- >      manager <- newManager tlsManagerSettings
 -- >      runResourceT $ do
 -- >          response <- http request manager
--- >          responseBody response C.$$+- sinkFile "google.html"
+-- >          runConduit $ responseBody response .| sinkFile "google.html"
 --
 -- The following headers are automatically set by this module, and should not
 -- be added to 'requestHeaders':
@@ -160,6 +159,9 @@ module Network.HTTP.Conduit
     , rawBody
     , decompress
     , redirectCount
+#if MIN_VERSION_http_client(0,6,2)
+    , shouldStripHeaderOnRedirect
+#endif
     , checkResponse
     , responseTimeout
     , cookieJar
@@ -181,11 +183,8 @@ module Network.HTTP.Conduit
     , Manager
     , newManager
     , closeManager
-    , withManager
-    , withManagerSettings
       -- ** Settings
     , ManagerSettings
-    , conduitManagerSettings
     , tlsManagerSettings
     , mkManagerSettings
     , managerConnCount
@@ -225,13 +224,12 @@ module Network.HTTP.Conduit
 
 import qualified Data.ByteString              as S
 import qualified Data.ByteString.Lazy         as L
-import           Data.Conduit                 (ResumableSource, ($$+-), await, ($$++), ($$+), Source, addCleanup)
-import qualified Data.Conduit.Internal        as CI
+import           Data.Conduit
 import qualified Data.Conduit.List            as CL
 import           Data.IORef                   (readIORef, writeIORef, newIORef)
 import           Data.Int                     (Int64)
 import           Control.Applicative          as A ((<$>))
-import           Control.Monad.IO.Class       (MonadIO (liftIO))
+import           Control.Monad.IO.Unlift      (MonadIO (liftIO))
 import           Control.Monad.Trans.Resource
 
 import qualified Network.HTTP.Client          as Client (httpLbs, responseOpen, responseClose)
@@ -301,31 +299,14 @@ simpleHttp url = liftIO $ do
     req <- liftIO $ parseUrlThrow url
     responseBody A.<$> httpLbs (setConnectionClose req) man
 
-conduitManagerSettings :: ManagerSettings
-conduitManagerSettings = tlsManagerSettings
-{-# DEPRECATED conduitManagerSettings "Use tlsManagerSettings" #-}
-
-withManager :: (MonadIO m, MonadBaseControl IO m)
-            => (Manager -> ResourceT m a)
-            -> m a
-withManager = withManagerSettings tlsManagerSettings
-{-# DEPRECATED withManager "Please use newManager tlsManagerSettings" #-}
-
-withManagerSettings :: (MonadIO m, MonadBaseControl IO m)
-                    => ManagerSettings
-                    -> (Manager -> ResourceT m a)
-                    -> m a
-withManagerSettings set f = liftIO (newManager set) >>= runResourceT . f
-{-# DEPRECATED withManagerSettings "Please use newManager" #-}
-
 setConnectionClose :: Request -> Request
 setConnectionClose req = req{requestHeaders = ("Connection", "close") : requestHeaders req}
 
 lbsResponse :: Monad m
-            => Response (ResumableSource m S.ByteString)
+            => Response (ConduitM () S.ByteString m ())
             -> m (Response L.ByteString)
 lbsResponse res = do
-    bss <- responseBody res $$+- CL.consume
+    bss <- runConduit $ responseBody res .| CL.consume
     return res
         { responseBody = L.fromChunks bss
         }
@@ -333,27 +314,21 @@ lbsResponse res = do
 http :: MonadResource m
      => Request
      -> Manager
-     -> m (Response (ResumableSource m S.ByteString))
+     -> m (Response (ConduitM i S.ByteString m ()))
 http req man = do
     (key, res) <- allocate (Client.responseOpen req man) Client.responseClose
-#if MIN_VERSION_conduit(1, 2, 0)
-    let rsrc = CI.ResumableSource
-            (flip CI.unConduitM CI.Done $ addCleanup (const $ release key) $ HCC.bodyReaderSource $ responseBody res)
-            (release key)
-#else
-    let rsrc = CI.ResumableSource
-            (addCleanup (const $ release key) $ HCC.bodyReaderSource $ responseBody res)
-            (release key)
-#endif
-    return res { responseBody = rsrc }
+    return res { responseBody = do
+                   HCC.bodyReaderSource $ responseBody res
+                   release key
+               }
 
-requestBodySource :: Int64 -> Source (ResourceT IO) S.ByteString -> RequestBody
+requestBodySource :: Int64 -> ConduitM () S.ByteString (ResourceT IO) () -> RequestBody
 requestBodySource size = RequestBodyStream size . srcToPopper
 
-requestBodySourceChunked :: Source (ResourceT IO) S.ByteString -> RequestBody
+requestBodySourceChunked :: ConduitM () S.ByteString (ResourceT IO) () -> RequestBody
 requestBodySourceChunked = RequestBodyStreamChunked . srcToPopper
 
-srcToPopper :: Source (ResourceT IO) S.ByteString -> HCC.GivesPopper ()
+srcToPopper :: ConduitM () S.ByteString (ResourceT IO) () -> HCC.GivesPopper ()
 srcToPopper src f = runResourceT $ do
     (rsrc0, ()) <- src $$+ return ()
     irsrc <- liftIO $ newIORef rsrc0
@@ -370,8 +345,8 @@ srcToPopper src f = runResourceT $ do
                     | otherwise -> return bs
     liftIO $ f popper
 
-requestBodySourceIO :: Int64 -> Source IO S.ByteString -> RequestBody
+requestBodySourceIO :: Int64 -> ConduitM () S.ByteString IO () -> RequestBody
 requestBodySourceIO = HCC.requestBodySource
 
-requestBodySourceChunkedIO :: Source IO S.ByteString -> RequestBody
+requestBodySourceChunkedIO :: ConduitM () S.ByteString IO () -> RequestBody
 requestBodySourceChunkedIO = HCC.requestBodySourceChunked

@@ -1,3 +1,69 @@
+# ChangeLog for http-conduit
+
+## 2.3.7.3
+
+* Relax test suite version bounds
+
+## 2.3.7.2
+
+* Add the `network3` flag
+
+## 2.3.7.1
+
+* Properly skip whitespace after JSON body [#401](https://github.com/snoyberg/http-client/issues/401)
+
+## 2.3.7
+
+* Ensure entire JSON response body is consumed [#395](https://github.com/snoyberg/http-client/issues/395)
+
+## 2.3.6.1
+
+* Add back compatibility with older http-client version [#393](https://github.com/snoyberg/http-client/pull/393)
+
+## 2.3.6
+
+* Add `httpSource` to `Network.HTTP.Client.Conduit` [#390](https://github.com/snoyberg/http-client/pull/390).
+
+## 2.3.5
+
+* Adds `addToRequestQueryString` helper function
+
+## 2.3.4
+
+* Reexport RequestHeaders from Network.HTTP.Types (what was intended in last version)
+* Fix mistake in ChangeLog
+
+## 2.3.3
+
+* Reexport Header, QueryItem and ResponseHeaders from Network.HTTP.Types
+* Rewrite a type signature of setRequestHeaders with RequestHeaders
+
+## 2.3.2
+
+* Adds `parseRequestThrow`, `parseRequestThrow_`, and
+  `setRequestCheckStatus` to `Network.HTTP.Simple`.
+  See [#304](https://github.com/snoyberg/http-client/issues/304)
+
+## 2.3.1
+
+* Reexport Query from Network.HTTP.Types
+* Rewrite a type signatures of getRequestQueryString and setRequestQueryString with Query
+
+## 2.3.0
+
+* conduit 1.3 support
+    * NOTE: Even for older versions of conduit, this includes dropping
+      support for finalizers
+* `http` returns a `Source` instead of a `ResumableSource` (due to lack of
+  finalizers)
+* Drop monad-control for unliftio
+* Removed some deprecated functions: `withManager`, `withManagerSettings`,
+  `conduitManagerSettings`
+
+## 2.2.4
+
+* Add `httpBS` to `Network.HTTP.Simple`
+
 ## 2.2.3.2
 
 * Add proper headers for `httpJSON` and `httpJSONEither` [#284](https://github.com/snoyberg/http-client/issues/284)

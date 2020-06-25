@@ -11,10 +11,13 @@ module Network.HTTP.Client.Request
     , parseUrlThrow
     , parseRequest
     , parseRequest_
+    , requestFromURI
+    , requestFromURI_
     , defaultRequest
     , setUriRelative
     , getUri
     , setUri
+    , setUriEither
     , browserDecompress
     , alwaysDecompress
     , addProxy
@@ -24,10 +27,15 @@ module Network.HTTP.Client.Request
     , needsGunzip
     , requestBuilder
     , setRequestIgnoreStatus
+    , setRequestCheckStatus
     , setQueryString
+#if MIN_VERSION_http_types(0,12,1)
+    , setQueryStringPartialEscape
+#endif
     , streamFile
     , observedStreamFile
     , extractBasicAuthInfo
+    , throwErrorStatusCodes
     ) where
 
 import Data.Int (Int64)
@@ -37,6 +45,7 @@ import Data.String (IsString(..))
 import Data.Char (toLower)
 import Control.Applicative as A ((<$>))
 import Control.Monad (unless, guard)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Numeric (showHex)
 
 import Blaze.ByteString.Builder (Builder, fromByteString, fromLazyByteString, toByteStringIO, flush)
@@ -53,7 +62,7 @@ import Network.URI (URI (..), URIAuth (..), parseURI, relativeTo, escapeURIStrin
 import Control.Exception (throw, throwIO, IOException)
 import qualified Control.Exception as E
 import qualified Data.CaseInsensitive as CI
-import qualified Data.ByteString.Base64 as B64
+import qualified Data.ByteArray.Encoding as BAE
 
 import Network.HTTP.Client.Body
 import Network.HTTP.Client.Types
@@ -72,29 +81,37 @@ parseUrl :: MonadThrow m => String -> m Request
 parseUrl = parseUrlThrow
 {-# DEPRECATED parseUrl "Please use parseUrlThrow, parseRequest, or parseRequest_ instead" #-}
 
--- | Same as 'parseRequest', except will throw an 'HttpException' in
--- the event of a non-2XX response.
+-- | Same as 'parseRequest', except will throw an 'HttpException' in the
+-- event of a non-2XX response. This uses 'throwErrorStatusCodes' to
+-- implement 'checkResponse'.
 --
 -- @since 0.4.30
 parseUrlThrow :: MonadThrow m => String -> m Request
 parseUrlThrow =
     liftM yesThrow . parseRequest
   where
-    yesThrow req = req
-        { checkResponse = \_req res ->
-            let W.Status sci _ = responseStatus res in
-            if 200 <= sci && sci < 300
-                then return ()
-                else do
-                    chunk <- brReadSome (responseBody res) 1024
-                    let res' = fmap (const ()) res
-                    throwHttp $ StatusCodeException res' (L.toStrict chunk)
-        }
+    yesThrow req = req { checkResponse = throwErrorStatusCodes }
+
+-- | Throws a 'StatusCodeException' wrapped in 'HttpExceptionRequest',
+-- if the response's status code indicates an error (if it isn't 2xx).
+-- This can be used to implement 'checkResponse'.
+--
+-- @since 0.5.13
+throwErrorStatusCodes :: MonadIO m => Request -> Response BodyReader -> m ()
+throwErrorStatusCodes req res = do
+    let W.Status sci _ = responseStatus res
+    if 200 <= sci && sci < 300
+        then return ()
+        else liftIO $ do
+            chunk <- brReadSome (responseBody res) 1024
+            let res' = fmap (const ()) res
+            let ex = StatusCodeException res' (L.toStrict chunk)
+            throwIO $ HttpExceptionRequest req ex
 
 -- | Convert a URL into a 'Request'.
 --
--- This defaults some of the values in 'Request', such as setting 'method' to
--- GET and 'requestHeaders' to @[]@.
+-- This function defaults some of the values in 'Request', such as setting 'method' to
+-- @"GET"@ and 'requestHeaders' to @[]@.
 --
 -- Since this function uses 'MonadThrow', the return monad can be anything that is
 -- an instance of 'MonadThrow', such as 'IO' or 'Maybe'.
@@ -108,8 +125,8 @@ parseUrlThrow =
 --
 -- Note that the request method must be provided as all capital letters.
 --
--- 'Request' created by this function won't cause exceptions on non-2XX
--- response status codes. 
+-- A 'Request' created by this function won't cause exceptions on non-2XX
+-- response status codes.
 --
 -- To create a request which throws on non-2XX status codes, see 'parseUrlThrow'
 --
@@ -131,11 +148,34 @@ parseRequest s' =
             Nothing -> req
             Just m -> req { method = S8.pack m }
 
--- | Same as 'parseRequest', but in the cases of a parse error
--- generates an impure exception. Mostly useful for static strings which
--- are known to be correctly formatted.
+-- | Same as 'parseRequest', but parse errors cause an impure exception.
+-- Mostly useful for static strings which are known to be correctly
+-- formatted.
 parseRequest_ :: String -> Request
 parseRequest_ = either throw id . parseRequest
+
+-- | Convert a 'URI' into a 'Request'.
+--
+-- This can fail if the given 'URI' is not absolute, or if the
+-- 'URI' scheme is not @"http"@ or @"https"@. In these cases the function
+-- will throw an error via 'MonadThrow'.
+--
+-- This function defaults some of the values in 'Request', such as setting 'method' to
+-- @"GET"@ and 'requestHeaders' to @[]@.
+--
+-- A 'Request' created by this function won't cause exceptions on non-2XX
+-- response status codes.
+--
+-- @since 0.5.12
+requestFromURI :: MonadThrow m => URI -> m Request
+requestFromURI = setUri defaultRequest
+
+-- | Same as 'requestFromURI', but if the conversion would fail,
+-- throws an impure exception.
+--
+-- @since 0.5.12
+requestFromURI_ :: URI -> Request
+requestFromURI_ = either throw id . requestFromURI
 
 -- | Add a 'URI' to the request. If it is absolute (includes a host name), add
 -- it as per 'setUri'; if it is relative, merge it with the existing request.
@@ -153,7 +193,7 @@ getUri req = URI
     , uriAuthority = Just URIAuth
         { uriUserInfo = ""
         , uriRegName = S8.unpack $ host req
-        , uriPort = ':' : show (port req)
+        , uriPort = port'
         }
     , uriPath = S8.unpack $ path req
     , uriQuery =
@@ -162,6 +202,11 @@ getUri req = URI
             _ -> S8.unpack $ queryString req
     , uriFragment = ""
     }
+  where
+    port'
+      | secure req && (port req) == 443 = ""
+      | not (secure req) && (port req) == 80 = ""
+      | otherwise = ':' : show (port req)
 
 applyAnyUriBasedAuth :: URI -> Request -> Request
 applyAnyUriBasedAuth uri req =
@@ -182,9 +227,18 @@ extractBasicAuthInfo uri = do
 
 -- | Validate a 'URI', then add it to the request.
 setUri :: MonadThrow m => Request -> URI -> m Request
-setUri req uri = do
+setUri req uri = either throwInvalidUrlException return (setUriEither req uri)
+  where
+    throwInvalidUrlException = throwM . InvalidUrlException (show uri)
+
+-- | A variant of `setUri` that returns an error message on validation errors,
+-- instead of propagating them with `throwM`.
+--
+-- @since 0.6.1
+setUriEither :: Request -> URI -> Either String Request
+setUriEither req uri = do
     sec <- parseScheme uri
-    auth <- maybe (failUri "URL must be absolute") return $ uriAuthority uri
+    auth <- maybe (Left "URL must be absolute") return $ uriAuthority uri
     port' <- parsePort sec auth
     return $ applyAnyUriBasedAuth uri req
         { host = S8.pack $ uriRegName auth
@@ -197,28 +251,28 @@ setUri req uri = do
         , queryString = S8.pack $ uriQuery uri
         }
   where
-    failUri :: MonadThrow m => String -> m a
-    failUri = throwM . InvalidUrlException (show uri)
-
     parseScheme URI{uriScheme = scheme} =
         case map toLower scheme of
             "http:"  -> return False
             "https:" -> return True
-            _        -> failUri "Invalid scheme"
+            _        -> Left "Invalid scheme"
 
     parsePort sec URIAuth{uriPort = portStr} =
         case portStr of
             -- If the user specifies a port, then use it
             ':':rest -> maybe
-                (failUri "Invalid port")
+                (Left "Invalid port")
                 return
-                (readDec rest)
+                (readPositiveInt rest)
             -- Otherwise, use the default port
             _ -> case sec of
                     False {- HTTP -} -> return 80
                     True {- HTTPS -} -> return 443
 
--- | A default request value
+-- | A default request value, a GET request of localhost/:80, with an
+-- empty request body.
+--
+-- Note that the default 'checkResponse' does nothing.
 --
 -- @since 0.4.30
 defaultRequest :: Request
@@ -245,6 +299,7 @@ defaultRequest = Request
                 Just (_ :: IOException) -> return ()
                 Nothing -> throwIO se
         , requestManagerOverride = Nothing
+        , shouldStripHeaderOnRedirect = const False
         }
 
 -- | Parses a URL via 'parseRequest_'
@@ -263,6 +318,14 @@ alwaysDecompress = const True
 browserDecompress :: S.ByteString -> Bool
 browserDecompress = (/= "application/x-tar")
 
+-- | Build a basic-auth header value
+buildBasicAuth ::
+    S8.ByteString -- ^ Username
+    -> S8.ByteString -- ^ Password
+    -> S8.ByteString
+buildBasicAuth user passwd =
+    S8.append "Basic " (BAE.convertToBase BAE.Base64 (S8.concat [ user, ":", passwd ]))
+
 -- | Add a Basic Auth header (with the specified user name and password) to the
 -- given Request. Ignore error handling:
 --
@@ -277,8 +340,7 @@ applyBasicAuth :: S.ByteString -> S.ByteString -> Request -> Request
 applyBasicAuth user passwd req =
     req { requestHeaders = authHeader : requestHeaders req }
   where
-    authHeader = (CI.mk "Authorization", basic)
-    basic = S8.append "Basic " (B64.encode $ S8.concat [ user, ":", passwd ])
+    authHeader = (CI.mk "Authorization", buildBasicAuth user passwd)
 
 -- | Add a proxy to the Request so that the Request when executed will use
 -- the provided proxy.
@@ -299,8 +361,7 @@ applyBasicProxyAuth :: S.ByteString -> S.ByteString -> Request -> Request
 applyBasicProxyAuth user passwd req =
     req { requestHeaders = authHeader : requestHeaders req }
   where
-    authHeader = (CI.mk "Proxy-Authorization", basic)
-    basic = S8.append "Basic " (B64.encode $ S8.concat [ user , ":", passwd ])
+    authHeader = (CI.mk "Proxy-Authorization", buildBasicAuth user passwd)
 
 -- | Add url-encoded parameters to the 'Request'.
 --
@@ -470,11 +531,26 @@ requestBuilder req Connection {..} = do
 setRequestIgnoreStatus :: Request -> Request
 setRequestIgnoreStatus req = req { checkResponse = \_ _ -> return () }
 
+-- | Modify the request so that non-2XX status codes generate a runtime
+-- 'StatusCodeException', by using 'throwErrorStatusCodes'
+--
+-- @since 0.5.13
+setRequestCheckStatus :: Request -> Request
+setRequestCheckStatus req = req { checkResponse = throwErrorStatusCodes }
+
 -- | Set the query string to the given key/value pairs.
 --
 -- Since 0.3.6
 setQueryString :: [(S.ByteString, Maybe S.ByteString)] -> Request -> Request
 setQueryString qs req = req { queryString = W.renderQuery True qs }
+
+#if MIN_VERSION_http_types(0,12,1)
+-- | Set the query string to the given key/value pairs.
+--
+-- @since 0.5.10
+setQueryStringPartialEscape :: [(S.ByteString, [W.EscapeItem])] -> Request -> Request
+setQueryStringPartialEscape qs req = req { queryString = W.renderQueryPartialEscape True qs }
+#endif
 
 -- | Send a file as the request body.
 --
